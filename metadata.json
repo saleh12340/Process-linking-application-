@@ -1,0 +1,6 @@
+{
+  "name": "استعراض البيانات المباشر",
+  "description": "تطبيق مراقبة واستعراض سجلات الحسابات المباشرة مع الخادم المحلي بنظام Real-time Polling وتصميم Material 3 عربي RTL.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
