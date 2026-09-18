@@ -21,19 +21,35 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle
 
-      - name: Grant execute permission for gradlew
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Generate debug keystore and local env
         run: |
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
+          touch .env
+          if [ -f "debug.keystore.base64" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore || true
+          fi
+          if [ ! -f "debug.keystore" ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -alias androiddebugkey \
+              -keypass android \
+              -storepass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Run Unit & Robolectric Tests
-        run: gradle :app:testDebugUnitTest
+      - name: Run Unit Tests
+        run: gradle :app:testDebugUnitTest --no-daemon
 
       - name: Build Debug APK
-        run: gradle :app:assembleDebug
+        run: gradle :app:assembleDebug --no-daemon
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
