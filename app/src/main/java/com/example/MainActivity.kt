@@ -137,6 +137,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.nio.charset.Charset
 import java.text.DecimalFormat
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -196,7 +197,10 @@ data class DashboardUiState(
   val totalTransactions: Int = 0,
   val totalCredit: Double = 0.0,
   val totalDebit: Double = 0.0,
-  val netBalance: Double = 0.0
+  val netBalance: Double = 0.0,
+  val rawResponse: String = "",
+  val detectedEncoding: String = "UTF-8",
+  val selectedEncoding: String = "auto" // auto, windows-1256, UTF-8, ISO-8859-6
 )
 
 // --- ViewModel ---
@@ -242,15 +246,27 @@ class DashboardViewModel : ViewModel() {
     }
   }
 
-  fun updateServerSettings(url: String, endpoint: String, interval: Int, simulationFallback: Boolean) {
+  fun updateServerSettings(
+    url: String,
+    endpoint: String,
+    interval: Int,
+    simulationFallback: Boolean,
+    encoding: String = _uiState.value.selectedEncoding
+  ) {
     val cleanUrl = url.trim().removeSuffix("/")
     val cleanEndpoint = if (endpoint.startsWith("/")) endpoint else "/$endpoint"
     _uiState.value = _uiState.value.copy(
       serverUrl = cleanUrl,
       serverEndpoint = cleanEndpoint,
       pollingIntervalSeconds = interval.coerceIn(2, 60),
-      simulationFallbackEnabled = simulationFallback
+      simulationFallbackEnabled = simulationFallback,
+      selectedEncoding = encoding
     )
+    refreshData(isManual = true)
+  }
+
+  fun setSelectedEncoding(encoding: String) {
+    _uiState.value = _uiState.value.copy(selectedEncoding = encoding)
     refreshData(isManual = true)
   }
 
@@ -296,18 +312,30 @@ class DashboardViewModel : ViewModel() {
       try {
         val request = Request.Builder()
           .url(fullUrl)
-          .header("Accept", "application/json, text/html, */*")
+          .header("Accept", "text/html, application/json, */*")
+          .header("User-Agent", "Mozilla/5.0 (Android; AccountingApp)")
           .build()
 
         val response = httpClient.newCall(request).execute()
-        val responseBody = response.body?.string() ?: ""
+        val rawBytes = response.body?.bytes() ?: byteArrayOf()
+        val contentType = response.header("Content-Type")
 
         if (response.isSuccessful) {
-          val parsedItems = parseResponse(responseBody)
+          val (decodedBody, detectedEnc) = decodeResponseBytes(
+            rawBytes,
+            contentType,
+            _uiState.value.selectedEncoding
+          )
+
+          val parsedItems = parseResponse(decodedBody)
           // Strictly sort in descending chronological order (Newest first / الأحدث زمنيًا)
           val sortedItems = parsedItems.sortedByDescending { it.timestamp }
 
           withContext(Dispatchers.Main) {
+            _uiState.value = _uiState.value.copy(
+              rawResponse = decodedBody,
+              detectedEncoding = detectedEnc
+            )
             updateRecordsState(sortedItems, ServerStatus.CONNECTED, null)
           }
         } else {
@@ -316,7 +344,6 @@ class DashboardViewModel : ViewModel() {
       } catch (e: Exception) {
         withContext(Dispatchers.Main) {
           if (_uiState.value.simulationFallbackEnabled && _uiState.value.records.isEmpty()) {
-            // Generate initial live local sample ledger for offline/LAN container demo
             val sampleItems = generateInitialRecords().sortedByDescending { it.timestamp }
             updateRecordsState(
               sampleItems,
@@ -335,18 +362,74 @@ class DashboardViewModel : ViewModel() {
     }
   }
 
+  private fun decodeResponseBytes(
+    bytes: ByteArray,
+    contentType: String?,
+    forcedEncoding: String
+  ): Pair<String, String> {
+    if (bytes.isEmpty()) return Pair("", "Empty")
+
+    if (forcedEncoding != "auto") {
+      try {
+        val str = String(bytes, Charset.forName(forcedEncoding))
+        return Pair(str, forcedEncoding)
+      } catch (_: Exception) {}
+    }
+
+    // Check charset in Content-Type header
+    if (contentType != null) {
+      val match = Regex("charset=([a-zA-Z0-9_-]+)", RegexOption.IGNORE_CASE).find(contentType)
+      if (match != null) {
+        val csName = match.groupValues[1].trim('\'', '"', ' ')
+        try {
+          val str = String(bytes, Charset.forName(csName))
+          return Pair(str, csName)
+        } catch (_: Exception) {}
+      }
+    }
+
+    // Try Windows-1256 (Common for Arabic Desktop & Windows accounting servers)
+    val win1256Str = try {
+      String(bytes, Charset.forName("windows-1256"))
+    } catch (_: Exception) { null }
+
+    // Try UTF-8
+    val utf8Str = String(bytes, Charsets.UTF_8)
+    val utf8ReplacementCount = utf8Str.count { it == '\uFFFD' }
+    val utf8ArabicCount = utf8Str.count { it in '\u0600'..'\u06FF' }
+
+    val win1256ArabicCount = win1256Str?.count { it in '\u0600'..'\u06FF' } ?: 0
+
+    // If UTF-8 has broken replacement characters or Windows-1256 has vastly more Arabic characters
+    if (utf8ReplacementCount > 0 && win1256ArabicCount > 0) {
+      return Pair(win1256Str!!, "windows-1256 (عربي)")
+    }
+
+    if (win1256ArabicCount > (utf8ArabicCount + 2) && win1256ArabicCount >= 4) {
+      return Pair(win1256Str!!, "windows-1256 (عربي)")
+    }
+
+    return Pair(utf8Str, "UTF-8")
+  }
+
   private fun parseResponse(body: String): List<RecordItem> {
     val items = mutableListOf<RecordItem>()
     val trimmed = body.trim()
+    if (trimmed.isEmpty()) return items
 
     try {
+      // 1. JSON Array
       if (trimmed.startsWith("[")) {
         val jsonArray = JSONArray(trimmed)
         for (i in 0 until jsonArray.length()) {
           val obj = jsonArray.optJSONObject(i) ?: continue
           parseJsonObjectToRecord(obj)?.let { items.add(it) }
         }
-      } else if (trimmed.startsWith("{")) {
+        if (items.isNotEmpty()) return items
+      }
+
+      // 2. JSON Object
+      if (trimmed.startsWith("{")) {
         val jsonObject = JSONObject(trimmed)
         val dataArray = jsonObject.optJSONArray("data")
           ?: jsonObject.optJSONArray("records")
@@ -361,27 +444,28 @@ class DashboardViewModel : ViewModel() {
         } else {
           parseJsonObjectToRecord(jsonObject)?.let { items.add(it) }
         }
-      } else {
-        // Fallback line parsing if plain text / CSV format
-        val lines = trimmed.lines()
-        for ((index, line) in lines.withIndex()) {
-          if (line.isBlank() || line.startsWith("#")) continue
-          val parts = line.split(",", "\t", "|")
-          if (parts.size >= 3) {
-            val id = "REC-${1000 + index}"
-            val title = parts[0].trim()
-            val amount = parts[1].trim().toDoubleOrNull() ?: 0.0
-            val type = if (parts.size > 3) TransactionType.fromString(parts[3]) else TransactionType.CREDIT
-            items.add(
-              RecordItem(
-                id = id,
-                title = title,
-                amount = amount,
-                timestamp = System.currentTimeMillis() - (index * 120_000L),
-                details = if (parts.size > 2) parts[2].trim() else "معاملة حسابية",
-                type = type
-              )
-            )
+        if (items.isNotEmpty()) return items
+      }
+
+      // 3. HTML Table or HTML Content
+      val isHtml = Regex("<(html|table|tr|td|body|div|p|ul|li)", RegexOption.IGNORE_CASE).containsMatchIn(trimmed)
+      if (isHtml) {
+        val htmlItems = parseHtmlToRecords(trimmed)
+        if (htmlItems.isNotEmpty()) {
+          return htmlItems
+        }
+      }
+
+      // 4. Plain text / CSV / Delimited lines parsing
+      val lines = trimmed.lines()
+      for ((index, line) in lines.withIndex()) {
+        val cleanLine = cleanHtmlTags(line)
+        if (cleanLine.isBlank() || cleanLine.startsWith("#")) continue
+        val parts = cleanLine.split(",", "\t", "|").map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.size >= 2) {
+          val record = parseTextPartsToRecord(parts, index)
+          if (record != null) {
+            items.add(record)
           }
         }
       }
@@ -390,6 +474,199 @@ class DashboardViewModel : ViewModel() {
     }
 
     return items
+  }
+
+  private fun parseHtmlToRecords(html: String): List<RecordItem> {
+    val items = mutableListOf<RecordItem>()
+    // Remove scripts, styles, and comments
+    val cleanHtml = html
+      .replace(Regex("<script[\\s\\S]*?</script>", RegexOption.IGNORE_CASE), "")
+      .replace(Regex("<style[\\s\\S]*?</style>", RegexOption.IGNORE_CASE), "")
+      .replace(Regex("<head[\\s\\S]*?</head>", RegexOption.IGNORE_CASE), "")
+      .replace(Regex("<!--[\\s\\S]*?-->"), "")
+
+    // Find all table rows <tr>...</tr>
+    val trRegex = Regex("<tr[^>]*>([\\s\\S]*?)</tr>", RegexOption.IGNORE_CASE)
+    val trMatches = trRegex.findAll(cleanHtml).toList()
+
+    var rowCounter = 1
+    for (trMatch in trMatches) {
+      val rowHtml = trMatch.groupValues[1]
+      // Extract <td> or <th> cells
+      val tdRegex = Regex("<(td|th)[^>]*>([\\s\\S]*?)</(td|th)>", RegexOption.IGNORE_CASE)
+      val cells = tdRegex.findAll(rowHtml).map { match ->
+        cleanHtmlTags(match.groupValues[2])
+      }.filter { it.isNotBlank() }.toList()
+
+      if (cells.isNotEmpty()) {
+        val record = parseTableCellsToRecord(cells, rowCounter)
+        if (record != null) {
+          items.add(record)
+          rowCounter++
+        }
+      }
+    }
+
+    // If no valid table rows, parse <p>, <li>, or <div> blocks
+    if (items.isEmpty()) {
+      val blockRegex = Regex("<(p|li|div)[^>]*>([\\s\\S]*?)</(p|li|div)>", RegexOption.IGNORE_CASE)
+      val blocks = blockRegex.findAll(cleanHtml)
+        .map { cleanHtmlTags(it.groupValues[2]) }
+        .filter { it.length > 3 && !it.startsWith("<") }
+        .toList()
+
+      for ((idx, block) in blocks.withIndex()) {
+        val parts = block.split("-", ":", "•", "|", ",").map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.size >= 2) {
+          val record = parseTextPartsToRecord(parts, idx + 1)
+          if (record != null) items.add(record)
+        } else {
+          // Try extracting single line record
+          val amount = extractAmountFromText(block)
+          if (amount > 0) {
+            val type = if (block.contains("له") || block.contains("دائن") || block.contains("إيداع")) {
+              TransactionType.CREDIT
+            } else {
+              TransactionType.DEBIT
+            }
+            items.add(
+              RecordItem(
+                id = "REC-${1000 + idx}",
+                title = block.take(40),
+                amount = amount,
+                timestamp = System.currentTimeMillis() - (idx * 60_000L),
+                details = block,
+                type = type
+              )
+            )
+          }
+        }
+      }
+    }
+
+    return items
+  }
+
+  private fun parseTableCellsToRecord(cells: List<String>, rowIdx: Int): RecordItem? {
+    // Check if header row (e.g. "رقم القيد", "العميل", "المبلغ")
+    val headerKeywords = listOf("رقم", "العميل", "الاسم", "المبلغ", "البيان", "التاريخ", "مدين", "دائن", "رصيد", "id", "name", "amount", "date", "balance")
+    val isHeader = cells.any { cell -> headerKeywords.any { kw -> cell.equals(kw, ignoreCase = true) } }
+    if (isHeader && cells.none { extractAmountFromText(it) > 0 }) {
+      return null
+    }
+
+    var id = "REC-${1000 + rowIdx}"
+    var title = ""
+    var details = ""
+    var amount = 0.0
+    var isCredit = true
+    var dateString = ""
+
+    val amountsFound = mutableListOf<Double>()
+    val textsFound = mutableListOf<String>()
+
+    for (cell in cells) {
+      val parsedAmount = extractAmountFromText(cell)
+      val parsedDate = parseDateStringToTimestamp(cell)
+
+      if (parsedDate != null) {
+        dateString = cell
+      } else if (parsedAmount > 0) {
+        amountsFound.add(parsedAmount)
+      } else if (cell.length in 1..8 && (cell.all { it.isDigit() } || cell.startsWith("REC-") || cell.startsWith("#"))) {
+        id = if (cell.startsWith("REC-") || cell.startsWith("#")) cell else "REC-$cell"
+      } else {
+        textsFound.add(cell)
+      }
+
+      if (cell.contains("دائن") || cell.contains("له") || cell.contains("إيداع") || cell.contains("قبض") || cell.contains("+")) {
+        isCredit = true
+      } else if (cell.contains("مدين") || cell.contains("عليه") || cell.contains("صرف") || cell.contains("دفع") || cell.contains("-")) {
+        isCredit = false
+      }
+    }
+
+    if (amountsFound.isNotEmpty()) {
+      amount = amountsFound.first()
+    } else {
+      // If no amount found, try finding any number
+      val numMatch = Regex("(\\d+(?:\\.\\d+)?)").find(cells.joinToString(" "))
+      amount = numMatch?.value?.toDoubleOrNull() ?: 0.0
+    }
+
+    if (textsFound.isNotEmpty()) {
+      title = textsFound.first()
+      details = if (textsFound.size > 1) textsFound.drop(1).joinToString(" • ") else "قيد محاسبي مسجل"
+    } else {
+      title = "سجل حركة #$id"
+      details = cells.joinToString(" | ")
+    }
+
+    val timestamp = if (dateString.isNotEmpty()) {
+      parseDateStringToTimestamp(dateString) ?: (System.currentTimeMillis() - (rowIdx * 120_000L))
+    } else {
+      System.currentTimeMillis() - (rowIdx * 120_000L)
+    }
+
+    return RecordItem(
+      id = id,
+      title = title.take(50),
+      amount = Math.abs(amount),
+      timestamp = timestamp,
+      details = details,
+      type = if (isCredit) TransactionType.CREDIT else TransactionType.DEBIT,
+      rawDateString = dateString
+    )
+  }
+
+  private fun parseTextPartsToRecord(parts: List<String>, index: Int): RecordItem? {
+    var title = parts[0]
+    var amount = 0.0
+    var details = "معاملة محاسبية"
+    var type = TransactionType.CREDIT
+
+    for (p in parts) {
+      val parsedAmt = extractAmountFromText(p)
+      if (parsedAmt > 0 && amount == 0.0) {
+        amount = parsedAmt
+      }
+      if (p.contains("له") || p.contains("دائن") || p.contains("إيداع")) type = TransactionType.CREDIT
+      if (p.contains("عليه") || p.contains("مدين") || p.contains("صرف")) type = TransactionType.DEBIT
+    }
+
+    if (parts.size >= 3) {
+      details = parts[2]
+    }
+
+    return RecordItem(
+      id = "REC-${1000 + index}",
+      title = title.take(45),
+      amount = amount,
+      timestamp = System.currentTimeMillis() - (index * 120_000L),
+      details = details,
+      type = type
+    )
+  }
+
+  private fun extractAmountFromText(text: String): Double {
+    val clean = text.replace(",", "").replace("ر.س", "").replace("SAR", "").replace("$", "").trim()
+    val match = Regex("[-+]?\\d+(?:\\.\\d+)?").find(clean)
+    return match?.value?.toDoubleOrNull() ?: 0.0
+  }
+
+  private fun cleanHtmlTags(raw: String): String {
+    return raw
+      .replace(Regex("<[^>]+>"), " ") // Remove all HTML tags
+      .replace("&nbsp;", " ")
+      .replace("&amp;", "&")
+      .replace("&quot;", "\"")
+      .replace("&lt;", "<")
+      .replace("&gt;", ">")
+      .replace(Regex("&#(\\d+);")) { match ->
+        try { match.groupValues[1].toInt().toChar().toString() } catch (_: Exception) { "" }
+      }
+      .replace(Regex("\\s+"), " ")
+      .trim()
   }
 
   private fun parseJsonObjectToRecord(obj: JSONObject): RecordItem? {
@@ -421,22 +698,23 @@ class DashboardViewModel : ViewModel() {
     val dateStr = obj.optString("date").ifEmpty { obj.optString("created_at") }
     val timestamp = when {
       tsValue > 0 -> if (tsValue < 1_000_000_000_000L) tsValue * 1000L else tsValue
-      dateStr.isNotEmpty() -> parseDateStringToTimestamp(dateStr)
+      dateStr.isNotEmpty() -> parseDateStringToTimestamp(dateStr) ?: System.currentTimeMillis()
       else -> System.currentTimeMillis()
     }
 
     return RecordItem(
       id = id,
-      title = title,
+      title = cleanHtmlTags(title),
       amount = Math.abs(amount),
       timestamp = timestamp,
-      details = details,
+      details = cleanHtmlTags(details),
       type = type,
       rawDateString = dateStr
     )
   }
 
-  private fun parseDateStringToTimestamp(dateStr: String): Long {
+  private fun parseDateStringToTimestamp(dateStr: String): Long? {
+    val clean = cleanHtmlTags(dateStr).trim()
     val patterns = arrayOf(
       "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
       "yyyy-MM-dd'T'HH:mm:ss'Z'",
@@ -444,16 +722,18 @@ class DashboardViewModel : ViewModel() {
       "yyyy-MM-dd HH:mm:ss",
       "yyyy-MM-dd",
       "dd/MM/yyyy HH:mm:ss",
-      "dd/MM/yyyy"
+      "dd/MM/yyyy",
+      "yyyy/MM/dd HH:mm:ss",
+      "yyyy/MM/dd"
     )
     for (p in patterns) {
       try {
         val sdf = SimpleDateFormat(p, Locale.US)
-        val date = sdf.parse(dateStr)
+        val date = sdf.parse(clean)
         if (date != null) return date.time
       } catch (_: Exception) {}
     }
-    return System.currentTimeMillis()
+    return null
   }
 
   private fun updateRecordsState(items: List<RecordItem>, status: ServerStatus, error: String?) {
@@ -608,6 +888,7 @@ fun LiveAccountingScreen(viewModel: DashboardViewModel = viewModel()) {
 
   var showSettingsDialog by remember { mutableStateOf(false) }
   var showFlutterCodeDialog by remember { mutableStateOf(false) }
+  var showRawResponseDialog by remember { mutableStateOf(false) }
 
   DisposableEffect(lifecycleOwner) {
     val observer = LifecycleEventObserver { _, event ->
@@ -670,6 +951,17 @@ fun LiveAccountingScreen(viewModel: DashboardViewModel = viewModel()) {
           }
         },
         actions = {
+          // Inspect Raw Response from Server
+          IconButton(
+            onClick = { showRawResponseDialog = true },
+            modifier = Modifier.testTag("raw_response_button")
+          ) {
+            Icon(
+              imageVector = Icons.Default.Info,
+              contentDescription = "معاينة رد الخادم الخام ومطابقة الترميز"
+            )
+          }
+
           // Manual Refresh Button
           IconButton(
             onClick = { viewModel.refreshData(isManual = true) },
@@ -701,7 +993,7 @@ fun LiveAccountingScreen(viewModel: DashboardViewModel = viewModel()) {
           ) {
             Icon(
               imageVector = Icons.Default.Settings,
-              contentDescription = "إعدادات الخادم"
+              contentDescription = "إعدادات الخادم والترميز"
             )
           }
         }
@@ -795,13 +1087,13 @@ fun LiveAccountingScreen(viewModel: DashboardViewModel = viewModel()) {
               verticalAlignment = Alignment.CenterVertically
             ) {
               Text(
-                text = "السجلات الأخيرة (مرتبة حسب الأحدث زمنيًا)",
+                text = "السجلات المستلمة (مرتبة حسب الأحدث زمنيًا):",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontWeight = FontWeight.Bold
               )
               Text(
-                text = "${uiState.filteredRecords.size} سجل",
+                text = "${uiState.filteredRecords.size} سجل (${uiState.detectedEncoding})",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.primary
               )
@@ -830,11 +1122,23 @@ fun LiveAccountingScreen(viewModel: DashboardViewModel = viewModel()) {
       currentEndpoint = uiState.serverEndpoint,
       currentInterval = uiState.pollingIntervalSeconds,
       simulationEnabled = uiState.simulationFallbackEnabled,
+      currentEncoding = uiState.selectedEncoding,
       onDismiss = { showSettingsDialog = false },
-      onSave = { url, ep, interval, sim ->
-        viewModel.updateServerSettings(url, ep, interval, sim)
+      onSave = { url, ep, interval, sim, enc ->
+        viewModel.updateServerSettings(url, ep, interval, sim, enc)
         showSettingsDialog = false
       }
+    )
+  }
+
+  // Raw Response Viewer Dialog
+  if (showRawResponseDialog) {
+    RawResponseViewerDialog(
+      rawResponse = uiState.rawResponse,
+      detectedEncoding = uiState.detectedEncoding,
+      selectedEncoding = uiState.selectedEncoding,
+      onEncodingChanged = { viewModel.setSelectedEncoding(it) },
+      onDismiss = { showRawResponseDialog = false }
     )
   }
 
@@ -1385,19 +1689,28 @@ fun ServerSettingsDialog(
   currentEndpoint: String,
   currentInterval: Int,
   simulationEnabled: Boolean,
+  currentEncoding: String = "auto",
   onDismiss: () -> Unit,
-  onSave: (url: String, endpoint: String, interval: Int, simulation: Boolean) -> Unit
+  onSave: (url: String, endpoint: String, interval: Int, simulation: Boolean, encoding: String) -> Unit
 ) {
   var urlInput by remember { mutableStateOf(currentUrl) }
   var endpointInput by remember { mutableStateOf(currentEndpoint) }
   var intervalInput by remember { mutableStateOf(currentInterval.toString()) }
   var simEnabled by remember { mutableStateOf(simulationEnabled) }
+  var selectedEnc by remember { mutableStateOf(currentEncoding) }
+
+  val encodings = listOf(
+    "auto" to "تلقائي (كشف ذكي)",
+    "windows-1256" to "Windows-1256 (عربي)",
+    "UTF-8" to "UTF-8",
+    "ISO-8859-6" to "ISO-8859-6"
+  )
 
   AlertDialog(
     onDismissRequest = onDismiss,
     title = {
       Text(
-        text = "إعدادات الاتصال بالخادم",
+        text = "إعدادات الاتصال والترميز",
         fontWeight = FontWeight.Bold
       )
     },
@@ -1433,6 +1746,42 @@ fun ServerSettingsDialog(
           modifier = Modifier.fillMaxWidth()
         )
 
+        // Encoding Selector
+        Column {
+          Text(
+            text = "ترميز النصوص العربية (Charset):",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold
+          )
+          Spacer(modifier = Modifier.height(4.dp))
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+          ) {
+            encodings.take(2).forEach { (encKey, encLabel) ->
+              FilterChip(
+                selected = selectedEnc == encKey,
+                onClick = { selectedEnc = encKey },
+                label = { Text(encLabel, fontSize = 11.sp) },
+                modifier = Modifier.weight(1f)
+              )
+            }
+          }
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+          ) {
+            encodings.drop(2).forEach { (encKey, encLabel) ->
+              FilterChip(
+                selected = selectedEnc == encKey,
+                onClick = { selectedEnc = encKey },
+                label = { Text(encLabel, fontSize = 11.sp) },
+                modifier = Modifier.weight(1f)
+              )
+            }
+          }
+        }
+
         Row(
           modifier = Modifier.fillMaxWidth(),
           verticalAlignment = Alignment.CenterVertically,
@@ -1461,7 +1810,7 @@ fun ServerSettingsDialog(
       Button(
         onClick = {
           val interval = intervalInput.toIntOrNull() ?: 4
-          onSave(urlInput, endpointInput, interval, simEnabled)
+          onSave(urlInput, endpointInput, interval, simEnabled, selectedEnc)
         }
       ) {
         Text("حفظ وتطبيق")
@@ -1470,6 +1819,128 @@ fun ServerSettingsDialog(
     dismissButton = {
       TextButton(onClick = onDismiss) {
         Text("إلغاء")
+      }
+    }
+  )
+}
+
+@Composable
+fun RawResponseViewerDialog(
+  rawResponse: String,
+  detectedEncoding: String,
+  selectedEncoding: String,
+  onEncodingChanged: (String) -> Unit,
+  onDismiss: () -> Unit
+) {
+  val context = LocalContext.current
+  val encodings = listOf(
+    "auto" to "تلقائي",
+    "windows-1256" to "Windows-1256 (عربي)",
+    "UTF-8" to "UTF-8"
+  )
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Text(
+          text = "الرد الفعلي من الخادم (Raw)",
+          fontWeight = FontWeight.Bold,
+          style = MaterialTheme.typography.titleMedium
+        )
+        Surface(
+          shape = RoundedCornerShape(8.dp),
+          color = MaterialTheme.colorScheme.primaryContainer
+        ) {
+          Text(
+            text = "الترميز: $detectedEncoding",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+          )
+        }
+      }
+    },
+    text = {
+      Column(
+        modifier = Modifier
+          .fillMaxWidth()
+          .height(380.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+      ) {
+        Text(
+          text = "تغيير الترميز الفوري:",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+          encodings.forEach { (encKey, encLabel) ->
+            FilterChip(
+              selected = selectedEncoding == encKey,
+              onClick = { onEncodingChanged(encKey) },
+              label = { Text(encLabel, fontSize = 11.sp) },
+              modifier = Modifier.weight(1f)
+            )
+          }
+        }
+
+        Surface(
+          shape = RoundedCornerShape(8.dp),
+          color = Slate900,
+          modifier = Modifier
+            .fillMaxWidth()
+            .weight(1f)
+        ) {
+          LazyColumn(
+            modifier = Modifier
+              .fillMaxSize()
+              .padding(10.dp)
+          ) {
+            item {
+              if (rawResponse.isEmpty()) {
+                Text(
+                  text = "لا توجد استجابة محملة حالياً من الخادم. اضغط على زر التحديث في الشاشة الرئيسية.",
+                  color = Slate100.copy(alpha = 0.6f),
+                  style = MaterialTheme.typography.bodySmall
+                )
+              } else {
+                Text(
+                  text = rawResponse,
+                  color = Emerald500,
+                  fontFamily = FontFamily.Monospace,
+                  fontSize = 12.sp,
+                  lineHeight = 16.sp
+                )
+              }
+            }
+          }
+        }
+      }
+    },
+    confirmButton = {
+      Button(
+        onClick = {
+          val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+          val clip = ClipData.newPlainText("Raw Server Response", rawResponse)
+          clipboard.setPrimaryClip(clip)
+          Toast.makeText(context, "تم نسخ النص الخام للحافظة بنجاح", Toast.LENGTH_SHORT).show()
+        }
+      ) {
+        Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+        Spacer(modifier = Modifier.width(6.dp))
+        Text("نسخ الرد")
+      }
+    },
+    dismissButton = {
+      TextButton(onClick = onDismiss) {
+        Text("إغلاق")
       }
     }
   )
